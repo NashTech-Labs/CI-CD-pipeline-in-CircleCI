@@ -1,0 +1,195 @@
+orbs:
+  aws-eks: circleci/aws-eks@1.1.0
+  aws-ecr: circleci/aws-ecr@7.0.0
+  kubernetes: circleci/kubernetes@0.11.2
+  aws-cli: circleci/aws-cli@2.0.0  
+  node: circleci/node@2.0.2
+
+jobs:
+  deploy-application: # Job2
+    executor: aws-eks/python3
+    parameters:
+      cluster-name:
+        default: <EKS_cluster_name>
+        description: |
+          Name of the EKS cluster
+        type: string
+      docker-image-name:
+        default: AWS_DEV_DOCKER_IMAGE_USER
+        description: |
+          Docker image base name
+        type: env_var_name
+      version-info:
+        default: v1.0
+        description: |
+         
+        type: string
+      aws-region:
+        default: <AWS_region-id>
+        description: |
+          AWS region
+        type: string
+    
+    steps:
+      - checkout
+      - aws-cli/setup:
+          aws-access-key-id: AWS_ACCESS_KEY
+          aws-secret-access-key: AWS_SECRET_KEY
+          aws-region: AWS_REGION
+      - aws-eks/update-kubeconfig-with-authenticator:
+          cluster-name: << parameters.cluster-name >>
+          install-kubectl: true
+          aws-region: << parameters.aws-region >>
+      - kubernetes/create-or-update-resource: 
+          resource-file-path: "<deployment_yamlfile_path>"
+          get-rollout-status: false
+          resource-name: <deployment name>
+          show-kubectl-command: true
+  restart-pod-and-update-image:
+    executor: aws-eks/python3
+    parameters:
+      cluster-name:
+        default: <EKS_cluster_name>
+        description: |
+          Name of the EKS cluster
+        type: string
+      aws-region:
+        default: <AWS_region-id>
+        description: |
+          AWS region
+        type: string
+      namespace:
+        default: nglc
+        description: |
+          k8s application namespace
+        type: string
+      eks-deployment-name:
+        default: <deployment name> 
+        description: |
+          application name
+        type: string
+    
+    steps:
+      - checkout
+      - aws-cli/setup:
+          aws-access-key-id: AWS_ACCESS_KEY
+          aws-secret-access-key: AWS_SECRET_KEY
+          aws-region: AWS_REGION
+      - aws-eks/update-kubeconfig-with-authenticator:
+          cluster-name: << parameters.cluster-name >>
+          install-kubectl: true
+          aws-region: << parameters.aws-region >>
+      - run:
+          name: Wait for service to be ready
+          command: |
+            kubectl -n << parameters.namespace >> rollout restart deployment/<< parameters.eks-deployment-name >>
+            sleep 30  
+  health-check:
+    executor: aws-eks/python3
+    parameters:
+      cluster-name:
+        default: <EKS_cluster_name>
+        description: |
+          Name of the EKS cluster
+        type: string
+      aws-region:
+        default: <aws_region_id>
+        description: |
+          AWS region
+        type: string
+      namespace:
+        default: <k8s_namespace_name>
+        description: |
+          k8s application namespace
+        type: string
+      eks-deployment-name:
+        default: <deployment_name>
+        description: |
+          application name
+        type: string
+      expected-version-info:
+        default: latest
+        description: |
+          Expected app version (this is used for testing that the
+          correct version has been deployed)
+        type: string
+    steps:
+      - aws-cli/setup:
+          aws-access-key-id: AWS_ACCESS_KEY
+          aws-secret-access-key: AWS_SECRET_KEY
+          aws-region: AWS_REGION
+      - aws-eks/update-kubeconfig-with-authenticator:
+          cluster-name: << parameters.cluster-name >>
+          install-kubectl: true
+          aws-region: << parameters.aws-region >>
+      - run:
+          name: Wait for service to be ready
+          command: |
+            kubectl -n << parameters.namespace >> get deployment
+            kubectl -n << parameters.namespace >> get svc
+            sleep 5
+            for attempt in {1..3}; do
+              AVAILABLE=$(kubectl -n << parameters.namespace >> get deployment/<< parameters.eks-deployment-name >> | awk '{print $4}' | tail -n1)
+              echo "Checking status: ${AVAILABLE}"
+              if [ -n "${AVAILABLE}" ] && [ -z $(echo "${AVAILABLE}" | grep "0") ]; then
+                break
+              fi
+              echo "Waiting for deployment to be ready: ${AVAILABLE}"
+              sleep 5
+            done
+            sleep 5
+            AVAILABLE=$(kubectl -n << parameters.namespace >> get deployment/<< parameters.eks-deployment-name >> | awk '{print $4}' | tail -n1)
+            if [ -n "${AVAILABLE}" ] && [ -z $(echo "${AVAILABLE}" | grep "0") ]; then
+              echo "Deployment Successfull"
+              echo "/n"
+              echo "=================================================TERMINAL LOGS=================================================================================="
+              kubectl -n << parameters.namespace >> logs svc/<< parameters.eks-deployment-name >> | tail -n5
+              echo "=================================================TERMINAL LOGS=================================================================================="
+              
+            else
+              echo "Nope"; 
+              echo "/n"
+              echo "=================================================DESCRIBING DEPLOYMENT========================================================================="
+              kubectl -n << parameters.namespace >> describe svc/<< parameters.eks-deployment-name >>
+              echo "=================================================DESCRIBING DEPLOYMENT========================================================================="
+              exit 1
+            fi 
+version: 2.1
+workflows:
+  build_and_deploy:
+    jobs:
+      - aws-ecr/build-and-push-image:
+          account-url: AWS_ECR_URL
+          aws-access-key-id: AWS_ACCESS_KEY
+          aws-secret-access-key: AWS_SECRET_KEY
+          # context: myContext
+          create-repo: true
+          dockerfile: <docker file path>
+          no-output-timeout: 20m
+          path: .
+          # profile-name: myProfileName
+          region: AWS_REGION
+          repo: <repo-name>
+          skip-when-tags-exist: false
+          tag: 'latest,0.1$CIRCLE_BUILD_NUM'         
+          filters:
+            branches:
+              only: <trigerring_branch> 
+      - deploy-application:
+          requires:
+            - aws-ecr/build-and-push-image
+          filters:
+            branches:
+              only: <trigerring_branch> 
+      - restart-pod-and-update-image:
+          requires:
+              - deploy-application
+          filters:
+            branches:
+              only: <trigerring_branch>
+      - health-check:
+          requires:
+            - restart-pod-and-update-image
+          filters:
+            branches:
+              only: <trigerring_branch>
